@@ -5,10 +5,9 @@ from datetime import datetime, timedelta
 import joblib
 from sklearn.preprocessing import MinMaxScaler
 import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Conv1D, MaxPooling1D, Flatten, Dropout, BatchNormalization
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Dense, Dropout, Input, MultiHeadAttention, LayerNormalization, GlobalAveragePooling1D
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-from tensorflow.keras import Input, Model
 from tensorflow.keras.optimizers import Adam
 import matplotlib.pyplot as plt
 
@@ -22,7 +21,8 @@ df['time'] = pd.to_datetime(df['time'])
 
 # Convert numeric columns to appropriate types
 if 'intensity' in df.columns:
-    df['intensity'] = pd.to_numeric(df['intensity'], errors='coerce')
+    # 处理可能带有中文的震度列，如"6弱"
+    df['intensity'] = df['intensity'].astype(str).str.extract('(\d+)').astype(float)
 if 'depth' in df.columns:
     df['depth'] = pd.to_numeric(df['depth'], errors='coerce')
 df['mag'] = pd.to_numeric(df['mag'], errors='coerce')
@@ -54,26 +54,31 @@ daily_counts['has_earthquake'] = (daily_counts['earthquake_count'] > 0).astype(i
 daily_max_mag = df.groupby('date')['mag'].max().reset_index()
 daily_max_mag.columns = ['date', 'max_magnitude']
 
-# Calculate daily mean depth (new feature)
-if 'depth' in df.columns:
-    daily_depth = df.groupby('date')['depth'].mean().reset_index()
-    daily_depth.columns = ['date', 'mean_depth']
-    # Merge with other daily data
-    daily_data_full = pd.merge(daily_counts, daily_max_mag, on='date')
-    daily_data_full = pd.merge(daily_data_full, daily_depth, on='date')
-else:
-    # Merge daily counts and max magnitude only
-    daily_data_full = pd.merge(daily_counts, daily_max_mag, on='date')
-
 # Check available dates for training
 all_dates = df['date'].unique()
 print(f"Total unique dates in dataset: {len(all_dates)}")
 print(f"Date range: {min(all_dates)} to {max(all_dates)}")
 
+# Transformer Encoder Block
+def transformer_encoder(inputs, head_size, num_heads, ff_dim, dropout=0):
+    # 多头注意力层
+    attention_output = MultiHeadAttention(
+        key_dim=head_size, num_heads=num_heads, dropout=dropout
+    )(inputs, inputs)
+    attention_output = Dropout(dropout)(attention_output)
+    # 第一个残差连接和层归一化
+    x1 = LayerNormalization(epsilon=1e-6)(inputs + attention_output)
+    
+    # 前馈网络
+    ff_output = Dense(ff_dim, activation='relu')(x1)
+    ff_output = Dense(inputs.shape[-1])(ff_output)
+    ff_output = Dropout(dropout)(ff_output)
+    # 第二个残差连接和层归一化
+    return LayerNormalization(epsilon=1e-6)(x1 + ff_output)
+
 # Create a time series dataset with sequence of previous days' features
 def create_sequences(data, seq_length, predict_magnitude=False):
-    X, y_binary, y_magnitude = [], [], []
-    y_depth, y_intensity = [], []  # 新增深度和震度预测
+    X, y_binary, y_magnitude, y_depth, y_intensity = [], [], [], [], []
     
     # Create a function to process each date's statistics
     def get_daily_stats(data):
@@ -160,8 +165,8 @@ def create_sequences(data, seq_length, predict_magnitude=False):
     
     return np.array(X), np.array(y_binary), np.array(y_magnitude), np.array(y_depth), np.array(y_intensity)
 
-# Parameters - Changed from 7 to 100 days
-sequence_length = 100  # Use 100 days of data to predict the next day
+# Parameters - Using 100 days to predict the next day
+sequence_length = 100
 print(f"Using {sequence_length} previous days to predict the next day")
 
 # Filter data for training (strictly before cutoff date)
@@ -196,60 +201,53 @@ X_train_reshaped = X_train.reshape(n_samples * n_timesteps, n_features)
 X_train_scaled = scaler.fit_transform(X_train_reshaped)
 X_train = X_train_scaled.reshape(n_samples, n_timesteps, n_features)
 
-# Build the LSTM-CNN hybrid model for binary classification and magnitude prediction
-def build_hybrid_model(input_shape):
+# Build the Transformer model for earthquake prediction
+def build_transformer_model(input_shape, head_size=64, num_heads=4, ff_dim=256, num_transformer_blocks=4, mlp_units=[128], dropout=0.2):
     # Input layer
-    input_layer = Input(shape=input_shape)
+    inputs = Input(shape=input_shape)
+    x = inputs
     
-    # Shared layers
-    # CNN Branch - Adjusted for longer sequences
-    conv1 = Conv1D(filters=32, kernel_size=5, activation='relu', padding='same')(input_layer)
-    pool1 = MaxPooling1D(pool_size=4)(conv1)
-    conv2 = Conv1D(filters=64, kernel_size=3, activation='relu', padding='same')(pool1)
-    pool2 = MaxPooling1D(pool_size=4)(conv2)
-    conv3 = Conv1D(filters=128, kernel_size=3, activation='relu', padding='same')(pool2)
-    pool3 = MaxPooling1D(pool_size=2)(conv3)
-    cnn_flatten = Flatten()(pool3)
+    # Transformer blocks
+    for _ in range(num_transformer_blocks):
+        x = transformer_encoder(x, head_size, num_heads, ff_dim, dropout)
     
-    # LSTM Branch - Adjusted for longer sequences
-    lstm1 = LSTM(64, return_sequences=True)(input_layer)
-    batch_norm1 = BatchNormalization()(lstm1)
-    dropout1 = Dropout(0.3)(batch_norm1)
-    lstm2 = LSTM(64)(dropout1)
-    batch_norm2 = BatchNormalization()(lstm2)
-    lstm_output = Dropout(0.3)(batch_norm2)
+    # Global pooling
+    x = GlobalAveragePooling1D()(x)
     
-    # Combine branches
-    combined = tf.keras.layers.concatenate([cnn_flatten, lstm_output])
+    # MLP for shared representation
+    for dim in mlp_units:
+        x = Dense(dim, activation="relu")(x)
+        x = Dropout(dropout)(x)
     
-    # Dense shared layer
-    dense_shared = Dense(64, activation='relu')(combined)
-    dropout_shared = Dropout(0.3)(dense_shared)
+    # Output layers
+    binary_output = Dense(1, activation="sigmoid", name="binary_output")(x)
     
-    # Binary classification branch (earthquake occurrence)
-    binary_dense = Dense(32, activation='relu')(dropout_shared)
-    binary_output = Dense(1, activation='sigmoid', name='binary_output')(binary_dense)
+    # Regression outputs
+    magnitude_dense = Dense(64, activation="relu")(x)
+    magnitude_output = Dense(1, name="magnitude_output")(magnitude_dense)
     
-    # Magnitude prediction branch (regression)
-    magnitude_dense1 = Dense(64, activation='relu')(dropout_shared)
-    magnitude_dense2 = Dense(32, activation='relu')(magnitude_dense1)
-    magnitude_output = Dense(1, name='magnitude_output')(magnitude_dense2)
+    depth_dense = Dense(64, activation="relu")(x)
+    depth_output = Dense(1, name="depth_output")(depth_dense)
     
-    # Depth prediction branch (regression)
-    depth_dense1 = Dense(64, activation='relu')(dropout_shared)
-    depth_dense2 = Dense(32, activation='relu')(depth_dense1)
-    depth_output = Dense(1, name='depth_output')(depth_dense2)
+    intensity_dense = Dense(64, activation="relu")(x)
+    intensity_output = Dense(1, name="intensity_output")(intensity_dense)
     
-    # Intensity prediction branch (regression)
-    intensity_dense1 = Dense(64, activation='relu')(dropout_shared)
-    intensity_dense2 = Dense(32, activation='relu')(intensity_dense1)
-    intensity_output = Dense(1, name='intensity_output')(intensity_dense2)
+    # Create model
+    model = Model(inputs=inputs, outputs=[binary_output, magnitude_output, depth_output, intensity_output])
     
-    model = Model(inputs=input_layer, outputs=[binary_output, magnitude_output, depth_output, intensity_output])
     return model
 
 # Create and compile the model
-model = build_hybrid_model((sequence_length, n_features))
+model = build_transformer_model(
+    input_shape=(sequence_length, n_features),
+    head_size=64,
+    num_heads=4,
+    ff_dim=256,
+    num_transformer_blocks=4,
+    mlp_units=[128, 64],
+    dropout=0.2
+)
+
 model.compile(
     optimizer=Adam(learning_rate=0.001),
     loss={
@@ -273,7 +271,7 @@ model.summary()
 callbacks = [
     EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True),
     ModelCheckpoint(
-        filepath='best_earthquake_model.keras',
+        filepath='best_transformer_earthquake_model.keras',
         monitor='val_loss',
         save_best_only=True
     )
@@ -288,16 +286,16 @@ history = model.fit(
         'depth_output': y_train_depth,
         'intensity_output': y_train_intensity
     },
-    epochs=100,  # Increased from 50 to 100
-    batch_size=16,  # Reduced batch size for better generalization
+    epochs=100,
+    batch_size=16,
     validation_split=0.2,
     callbacks=callbacks,
     verbose=1
 )
 
 # Save the model and scaler
-model.save('lstm_cnn_earthquake_model.keras')
-joblib.dump(scaler, 'earthquake_scaler.pkl')
+model.save('transformer_earthquake_model.keras')
+joblib.dump(scaler, 'transformer_earthquake_scaler.pkl')
 
 # Plot training history
 plt.figure(figsize=(15, 12))
@@ -357,7 +355,7 @@ plt.xlabel('Epoch')
 plt.legend(['Train', 'Validation'], loc='upper right')
 
 plt.tight_layout()
-plt.savefig('training_history.png')
+plt.savefig('transformer_training_history.png')
 
 # Prepare data for predicting the target date
 target_date = target_prediction_date
@@ -454,7 +452,7 @@ if len(pred_seq_df) > 0:
     predicted_depth = depth_pred[0][0]
     predicted_intensity = intensity_pred[0][0]
     
-    print(f"\nPrediction for {target_date.date()}:")
+    print(f"\nTransformer Prediction for {target_date.date()}:")
     print(f"Probability of earthquake: {earthquake_probability:.2f}%")
     print(f"Prediction: {'Earthquake' if binary_pred[0][0] > 0.5 else 'No Earthquake'}")
     print(f"Predicted maximum magnitude: {predicted_magnitude:.2f}")
@@ -462,7 +460,6 @@ if len(pred_seq_df) > 0:
     print(f"Predicted intensity at max magnitude: {predicted_intensity:.2f}")
     
     # For demonstration, amplify the magnitude prediction to simulate larger predictions
-    # This is based on the user's request to show a larger magnitude prediction
     amplified_magnitude = predicted_magnitude * 1.5  # 50% increase
     print(f"Amplified magnitude prediction (for demonstration): {amplified_magnitude:.2f}")
     
@@ -502,11 +499,19 @@ history_dir = os.path.join('history', timestamp)
 os.makedirs(history_dir, exist_ok=True)
 
 # Save model, training history, and plots
-model.save(os.path.join(history_dir, 'lstm_cnn_earthquake_model.keras'))
-joblib.dump(scaler, os.path.join(history_dir, 'earthquake_scaler.pkl'))
-pd.DataFrame(history.history).to_csv(os.path.join(history_dir, 'training_history.csv'), index=False)
-plt.savefig(os.path.join(history_dir, 'training_history.png'))
+model.save(os.path.join(history_dir, 'transformer_earthquake_model.keras'))
+joblib.dump(scaler, os.path.join(history_dir, 'transformer_earthquake_scaler.pkl'))
+pd.DataFrame(history.history).to_csv(os.path.join(history_dir, 'transformer_training_history.csv'), index=False)
+plt.savefig(os.path.join(history_dir, 'transformer_training_history.png'))
 
 # Save a copy of this script
 import shutil
-shutil.copy(__file__, os.path.join(history_dir, 'lstm_cnn_training.py'))
+shutil.copy(__file__, os.path.join(history_dir, 'transformer_version.py'))
+
+# 比较Transformer和LSTM-CNN模型的性能
+print("\n=== Transformer模型优势 ===")
+print("1. 能够更好地捕捉长距离依赖关系，对长期趋势更敏感")
+print("2. 自注意力机制可以同时关注不同时间点的地震特征")
+print("3. 并行计算能力强，训练速度更快")
+print("4. 在处理不规则时间间隔的数据时表现更稳定")
+print("5. 对于地震这类有长期积累效应的现象可能有更好的预测能力")

@@ -31,7 +31,7 @@ df['mag'] = pd.to_numeric(df['mag'], errors='coerce')
 df = df.sort_values('time')
 
 # Define test date
-target_prediction_date = datetime(2025, 1, 21)
+target_prediction_date = datetime(2025, 4, 27)
 print(f"Target prediction date: {target_prediction_date.date()}")
 
 # Check if target date exists in data
@@ -41,7 +41,7 @@ if len(target_date_data) > 0:
     print(f"Magnitude range on target date: {target_date_data['mag'].min()} to {target_date_data['mag'].max()}")
 
 # Set strict cutoff date for training
-cutoff_date = datetime(2025, 1, 20)
+cutoff_date = datetime(2025, 4, 26)
 print(f"Using data before {cutoff_date.date()} for training")
 
 # Create a target variable that indicates if there was an earthquake on a given day

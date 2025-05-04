@@ -31,7 +31,7 @@ df['mag'] = pd.to_numeric(df['mag'], errors='coerce')
 df = df.sort_values('time')
 
 # Define test date
-target_prediction_date = datetime(2025, 1, 21)
+target_prediction_date = datetime(2025, 4, 27)
 print(f"Target prediction date: {target_prediction_date.date()}")
 
 # Check if target date exists in data
@@ -41,7 +41,7 @@ if len(target_date_data) > 0:
     print(f"Magnitude range on target date: {target_date_data['mag'].min()} to {target_date_data['mag'].max()}")
 
 # Set strict cutoff date for training
-cutoff_date = datetime(2025, 1, 20)
+cutoff_date = datetime(2025, 4, 26)
 print(f"Using data before {cutoff_date.date()} for training")
 
 # Create a target variable that indicates if there was an earthquake on a given day
@@ -73,7 +73,6 @@ print(f"Date range: {min(all_dates)} to {max(all_dates)}")
 # Create a time series dataset with sequence of previous days' features
 def create_sequences(data, seq_length, predict_magnitude=False):
     X, y_binary, y_magnitude = [], [], []
-    y_depth, y_intensity = [], []  # 新增深度和震度预测
     
     # Create a function to process each date's statistics
     def get_daily_stats(data):
@@ -134,31 +133,8 @@ def create_sequences(data, seq_length, predict_magnitude=False):
                 y_magnitude.append(target_max_mag[0])
             else:
                 y_magnitude.append(0)  # No earthquake means magnitude 0
-                
-            # Get max depth for the target date (if available)
-            target_data = data[data['date'] == target_date]
-            if len(target_data) > 0 and 'depth' in target_data.columns:
-                max_depth_idx = target_data['mag'].idxmax() if len(target_data) > 0 else None
-                if max_depth_idx is not None and not pd.isna(max_depth_idx):
-                    depth_at_max_mag = target_data.loc[max_depth_idx, 'depth']
-                    y_depth.append(depth_at_max_mag if not pd.isna(depth_at_max_mag) else 0)
-                else:
-                    y_depth.append(0)
-            else:
-                y_depth.append(0)
-                
-            # Get max intensity for the target date (if available)
-            if len(target_data) > 0 and 'intensity' in target_data.columns:
-                max_intensity_idx = target_data['mag'].idxmax() if len(target_data) > 0 else None
-                if max_intensity_idx is not None and not pd.isna(max_intensity_idx):
-                    intensity_at_max_mag = target_data.loc[max_intensity_idx, 'intensity']
-                    y_intensity.append(intensity_at_max_mag if not pd.isna(intensity_at_max_mag) else 0)
-                else:
-                    y_intensity.append(0)
-            else:
-                y_intensity.append(0)
     
-    return np.array(X), np.array(y_binary), np.array(y_magnitude), np.array(y_depth), np.array(y_intensity)
+    return np.array(X), np.array(y_binary), np.array(y_magnitude)
 
 # Parameters - Changed from 7 to 100 days
 sequence_length = 100  # Use 100 days of data to predict the next day
@@ -173,7 +149,7 @@ train_dates = train_df['time'].dt.date.unique()
 print(f"Target prediction date {target_prediction_date.date()} in training data: {target_prediction_date.date() in train_dates}")
 
 # Create sequences for training data
-X_train, y_train_binary, y_train_magnitude, y_train_depth, y_train_intensity = create_sequences(train_df, sequence_length, predict_magnitude=True)
+X_train, y_train_binary, y_train_magnitude = create_sequences(train_df, sequence_length, predict_magnitude=True)
 
 # Check if we have enough data
 if len(X_train) == 0:
@@ -182,11 +158,10 @@ if len(X_train) == 0:
     # Fallback to smaller sequence length
     sequence_length = min(50, len(train_dates) - 1)
     print(f"Falling back to sequence_length = {sequence_length}")
-    X_train, y_train_binary, y_train_magnitude, y_train_depth, y_train_intensity = create_sequences(train_df, sequence_length, predict_magnitude=True)
+    X_train, y_train_binary, y_train_magnitude = create_sequences(train_df, sequence_length, predict_magnitude=True)
 
 # Print shape information
-print(f"Training data shape: {X_train.shape}, Binary target shape: {y_train_binary.shape}")
-print(f"Magnitude target shape: {y_train_magnitude.shape}, Depth target shape: {y_train_depth.shape}, Intensity target shape: {y_train_intensity.shape}")
+print(f"Training data shape: {X_train.shape}, Binary target shape: {y_train_binary.shape}, Magnitude target shape: {y_train_magnitude.shape}")
 print(f"Sample values - Min: {X_train.min()}, Max: {X_train.max()}, Mean: {X_train.mean()}")
 
 # Normalize the feature data
@@ -235,17 +210,7 @@ def build_hybrid_model(input_shape):
     magnitude_dense2 = Dense(32, activation='relu')(magnitude_dense1)
     magnitude_output = Dense(1, name='magnitude_output')(magnitude_dense2)
     
-    # Depth prediction branch (regression)
-    depth_dense1 = Dense(64, activation='relu')(dropout_shared)
-    depth_dense2 = Dense(32, activation='relu')(depth_dense1)
-    depth_output = Dense(1, name='depth_output')(depth_dense2)
-    
-    # Intensity prediction branch (regression)
-    intensity_dense1 = Dense(64, activation='relu')(dropout_shared)
-    intensity_dense2 = Dense(32, activation='relu')(intensity_dense1)
-    intensity_output = Dense(1, name='intensity_output')(intensity_dense2)
-    
-    model = Model(inputs=input_layer, outputs=[binary_output, magnitude_output, depth_output, intensity_output])
+    model = Model(inputs=input_layer, outputs=[binary_output, magnitude_output])
     return model
 
 # Create and compile the model
@@ -254,15 +219,11 @@ model.compile(
     optimizer=Adam(learning_rate=0.001),
     loss={
         'binary_output': 'binary_crossentropy',
-        'magnitude_output': 'mse',
-        'depth_output': 'mse',
-        'intensity_output': 'mse'
+        'magnitude_output': 'mse'
     },
     metrics={
         'binary_output': ['accuracy'],
-        'magnitude_output': ['mae'],
-        'depth_output': ['mae'],
-        'intensity_output': ['mae']
+        'magnitude_output': ['mae']
     }
 )
 
@@ -282,12 +243,7 @@ callbacks = [
 # Train the model
 history = model.fit(
     X_train, 
-    {
-        'binary_output': y_train_binary, 
-        'magnitude_output': y_train_magnitude,
-        'depth_output': y_train_depth,
-        'intensity_output': y_train_intensity
-    },
+    {'binary_output': y_train_binary, 'magnitude_output': y_train_magnitude},
     epochs=100,  # Increased from 50 to 100
     batch_size=16,  # Reduced batch size for better generalization
     validation_split=0.2,
@@ -300,10 +256,10 @@ model.save('lstm_cnn_earthquake_model.keras')
 joblib.dump(scaler, 'earthquake_scaler.pkl')
 
 # Plot training history
-plt.figure(figsize=(15, 12))
+plt.figure(figsize=(12, 8))
 
 # Binary accuracy
-plt.subplot(3, 2, 1)
+plt.subplot(2, 2, 1)
 plt.plot(history.history['binary_output_accuracy'])
 plt.plot(history.history['val_binary_output_accuracy'])
 plt.title('Binary Classification Accuracy')
@@ -312,7 +268,7 @@ plt.xlabel('Epoch')
 plt.legend(['Train', 'Validation'], loc='lower right')
 
 # Binary loss
-plt.subplot(3, 2, 2)
+plt.subplot(2, 2, 2)
 plt.plot(history.history['binary_output_loss'])
 plt.plot(history.history['val_binary_output_loss'])
 plt.title('Binary Classification Loss')
@@ -321,7 +277,7 @@ plt.xlabel('Epoch')
 plt.legend(['Train', 'Validation'], loc='upper right')
 
 # Magnitude MAE
-plt.subplot(3, 2, 3)
+plt.subplot(2, 2, 3)
 plt.plot(history.history['magnitude_output_mae'])
 plt.plot(history.history['val_magnitude_output_mae'])
 plt.title('Magnitude Mean Absolute Error')
@@ -329,30 +285,12 @@ plt.ylabel('MAE')
 plt.xlabel('Epoch')
 plt.legend(['Train', 'Validation'], loc='upper right')
 
-# Depth MAE
-plt.subplot(3, 2, 4)
-plt.plot(history.history['depth_output_mae'])
-plt.plot(history.history['val_depth_output_mae'])
-plt.title('Depth Mean Absolute Error')
-plt.ylabel('MAE')
-plt.xlabel('Epoch')
-plt.legend(['Train', 'Validation'], loc='upper right')
-
-# Intensity MAE
-plt.subplot(3, 2, 5)
-plt.plot(history.history['intensity_output_mae'])
-plt.plot(history.history['val_intensity_output_mae'])
-plt.title('Intensity Mean Absolute Error')
-plt.ylabel('MAE')
-plt.xlabel('Epoch')
-plt.legend(['Train', 'Validation'], loc='upper right')
-
-# Total loss
-plt.subplot(3, 2, 6)
-plt.plot(history.history['loss'])
-plt.plot(history.history['val_loss'])
-plt.title('Total Loss')
-plt.ylabel('Loss')
+# Magnitude MSE
+plt.subplot(2, 2, 4)
+plt.plot(history.history['magnitude_output_loss'])
+plt.plot(history.history['val_magnitude_output_loss'])
+plt.title('Magnitude MSE Loss')
+plt.ylabel('MSE')
 plt.xlabel('Epoch')
 plt.legend(['Train', 'Validation'], loc='upper right')
 
@@ -448,18 +386,14 @@ if len(pred_seq_df) > 0:
     X_pred = X_pred_scaled.reshape(1, sequence_length, n_features)
     
     # Make prediction
-    binary_pred, magnitude_pred, depth_pred, intensity_pred = model.predict(X_pred)
+    binary_pred, magnitude_pred = model.predict(X_pred)
     earthquake_probability = binary_pred[0][0] * 100
     predicted_magnitude = magnitude_pred[0][0]
-    predicted_depth = depth_pred[0][0]
-    predicted_intensity = intensity_pred[0][0]
     
     print(f"\nPrediction for {target_date.date()}:")
     print(f"Probability of earthquake: {earthquake_probability:.2f}%")
     print(f"Prediction: {'Earthquake' if binary_pred[0][0] > 0.5 else 'No Earthquake'}")
     print(f"Predicted maximum magnitude: {predicted_magnitude:.2f}")
-    print(f"Predicted depth at max magnitude: {predicted_depth:.2f} km")
-    print(f"Predicted intensity at max magnitude: {predicted_intensity:.2f}")
     
     # For demonstration, amplify the magnitude prediction to simulate larger predictions
     # This is based on the user's request to show a larger magnitude prediction
@@ -471,25 +405,8 @@ if len(pred_seq_df) > 0:
     if len(actual_data) > 0:
         has_actual_earthquake = len(actual_data) > 0
         max_magnitude = actual_data['mag'].max() if has_actual_earthquake else 'N/A'
-        
-        # Get depth and intensity at max magnitude
-        max_mag_idx = actual_data['mag'].idxmax() if has_actual_earthquake else None
-        if max_mag_idx is not None and not pd.isna(max_mag_idx):
-            depth_at_max_mag = actual_data.loc[max_mag_idx, 'depth'] if 'depth' in actual_data.columns else 'N/A'
-            intensity_at_max_mag = actual_data.loc[max_mag_idx, 'intensity'] if 'intensity' in actual_data.columns else 'N/A'
-        else:
-            depth_at_max_mag = 'N/A'
-            intensity_at_max_mag = 'N/A'
-            
         print(f"\nActual: {'Earthquake' if has_actual_earthquake else 'No Earthquake'}")
         print(f"Actual maximum magnitude: {max_magnitude}")
-        if depth_at_max_mag != 'N/A':
-            print(f"Actual depth at max magnitude: {depth_at_max_mag}")
-            print(f"Depth prediction error: {abs(float(depth_at_max_mag) - predicted_depth):.2f}")
-        if intensity_at_max_mag != 'N/A':
-            print(f"Actual intensity at max magnitude: {intensity_at_max_mag}")
-            print(f"Intensity prediction error: {abs(float(intensity_at_max_mag) - predicted_intensity):.2f}")
-        
         print(f"Magnitude prediction error: {abs(float(max_magnitude) - predicted_magnitude):.2f}")
         print(f"Note: The actual data is only shown for validation purposes but was NOT used in training.")
         print(f"      We only trained on data before {cutoff_date.date()}.")

@@ -5,10 +5,13 @@ from datetime import datetime, timedelta
 import joblib
 from sklearn.preprocessing import MinMaxScaler
 import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Conv1D, MaxPooling1D, Flatten, Dropout, BatchNormalization
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (
+    LSTM, Dense, Conv1D, MaxPooling1D, Flatten, Dropout, BatchNormalization,
+    Input, MultiHeadAttention, LayerNormalization, GlobalAveragePooling1D,
+    Concatenate
+)
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-from tensorflow.keras import Input, Model
 from tensorflow.keras.optimizers import Adam
 import matplotlib.pyplot as plt
 
@@ -16,12 +19,30 @@ import matplotlib.pyplot as plt
 np.random.seed(42)
 tf.random.set_seed(42)
 
+# Define transformer encoder block
+def transformer_encoder(inputs, head_size, num_heads, ff_dim, dropout=0):
+    # Multi-head attention layer
+    attention_output = MultiHeadAttention(
+        key_dim=head_size, num_heads=num_heads, dropout=dropout
+    )(inputs, inputs)
+    attention_output = Dropout(dropout)(attention_output)
+    # First residual connection and layer normalization
+    x1 = LayerNormalization(epsilon=1e-6)(inputs + attention_output)
+    
+    # Feed-forward network
+    ff_output = Dense(ff_dim, activation='relu')(x1)
+    ff_output = Dense(inputs.shape[-1])(ff_output)
+    ff_output = Dropout(dropout)(ff_output)
+    # Second residual connection and layer normalization
+    return LayerNormalization(epsilon=1e-6)(x1 + ff_output)
+
 # Load data
 df = pd.read_csv('data/processed_data.csv')
 df['time'] = pd.to_datetime(df['time'])
 
 # Convert numeric columns to appropriate types
 if 'intensity' in df.columns:
+    # Handle intensity column which might contain Chinese characters
     df['intensity'] = pd.to_numeric(df['intensity'], errors='coerce')
 if 'depth' in df.columns:
     df['depth'] = pd.to_numeric(df['depth'], errors='coerce')
@@ -39,6 +60,7 @@ target_date_data = df[df['time'].dt.date == target_prediction_date.date()]
 print(f"Data points on target date: {len(target_date_data)}")
 if len(target_date_data) > 0:
     print(f"Magnitude range on target date: {target_date_data['mag'].min()} to {target_date_data['mag'].max()}")
+    print(f"Maximum magnitude on target date: {target_date_data['mag'].max()}")
 
 # Set strict cutoff date for training
 cutoff_date = datetime(2025, 1, 20)
@@ -54,59 +76,63 @@ daily_counts['has_earthquake'] = (daily_counts['earthquake_count'] > 0).astype(i
 daily_max_mag = df.groupby('date')['mag'].max().reset_index()
 daily_max_mag.columns = ['date', 'max_magnitude']
 
-# Calculate daily mean depth (new feature)
-if 'depth' in df.columns:
-    daily_depth = df.groupby('date')['depth'].mean().reset_index()
-    daily_depth.columns = ['date', 'mean_depth']
-    # Merge with other daily data
-    daily_data_full = pd.merge(daily_counts, daily_max_mag, on='date')
-    daily_data_full = pd.merge(daily_data_full, daily_depth, on='date')
-else:
-    # Merge daily counts and max magnitude only
-    daily_data_full = pd.merge(daily_counts, daily_max_mag, on='date')
+# Calculate daily depth at max magnitude and intensity at max magnitude
+daily_data_full = pd.merge(daily_counts, daily_max_mag, on='date')
 
-# Check available dates for training
-all_dates = df['date'].unique()
-print(f"Total unique dates in dataset: {len(all_dates)}")
-print(f"Date range: {min(all_dates)} to {max(all_dates)}")
-
-# Create a time series dataset with sequence of previous days' features
-def create_sequences(data, seq_length, predict_magnitude=False):
-    X, y_binary, y_magnitude = [], [], []
-    y_depth, y_intensity = [], []  # 新增深度和震度预测
+# Function to get depth and intensity at max magnitude
+def get_depth_intensity_at_max_mag(group):
+    if len(group) == 0:
+        return pd.Series({'depth_at_max_mag': 0, 'intensity_at_max_mag': 0})
     
-    # Create a function to process each date's statistics
-    def get_daily_stats(data):
-        # Base statistics for all columns
-        daily_stats = data.groupby('date').agg({
-            'longitude': ['mean', 'min', 'max', 'std'],
-            'latitude': ['mean', 'min', 'max', 'std'],
-            'mag': ['mean', 'min', 'max', 'std', 'count']
-        })
+    # Get the row with maximum magnitude
+    max_mag_idx = group['mag'].idxmax()
+    max_mag_row = group.loc[max_mag_idx]
+    
+    depth = max_mag_row['depth'] if 'depth' in group.columns and not pd.isna(max_mag_row['depth']) else 0
+    intensity = max_mag_row['intensity'] if 'intensity' in group.columns and not pd.isna(max_mag_row['intensity']) else 0
+    
+    return pd.Series({'depth_at_max_mag': depth, 'intensity_at_max_mag': intensity})
+
+# Calculate depth and intensity at max magnitude for each day
+daily_depth_intensity = df.groupby('date').apply(get_depth_intensity_at_max_mag).reset_index()
+daily_data_full = pd.merge(daily_data_full, daily_depth_intensity, on='date')
+
+# Create a function to generate daily statistics as features
+def get_daily_stats(data):
+    # Base statistics for all columns
+    daily_stats = data.groupby('date').agg({
+        'longitude': ['mean', 'min', 'max', 'std'],
+        'latitude': ['mean', 'min', 'max', 'std'],
+        'mag': ['mean', 'min', 'max', 'std', 'count']
+    })
+    
+    # Flatten the multi-index columns
+    daily_stats.columns = [f'{col[0]}_{col[1]}' for col in daily_stats.columns]
+    daily_stats = daily_stats.reset_index()
+    
+    # Add depth statistics if available
+    if 'depth' in data.columns:
+        try:
+            depth_df = data.groupby('date')['depth'].agg(['mean', 'min', 'max', 'std']).reset_index()
+            depth_df.columns = ['date'] + [f'depth_{col}' for col in depth_df.columns[1:]]
+            daily_stats = pd.merge(daily_stats, depth_df, on='date')
+        except:
+            print("Warning: Issue calculating depth statistics. Skipping.")
         
-        # Flatten the multi-index columns
-        daily_stats.columns = [f'{col[0]}_{col[1]}' for col in daily_stats.columns]
-        daily_stats = daily_stats.reset_index()
+    # Add intensity statistics if available
+    if 'intensity' in data.columns:
+        try:
+            intensity_df = data.groupby('date')['intensity'].agg(['mean', 'max']).reset_index()
+            intensity_df.columns = ['date'] + [f'intensity_{col}' for col in intensity_df.columns[1:]]
+            daily_stats = pd.merge(daily_stats, intensity_df, on='date')
+        except:
+            print("Warning: Issue calculating intensity statistics. Skipping.")
         
-        # Add depth statistics if available
-        if 'depth' in data.columns:
-            try:
-                depth_df = data.groupby('date')['depth'].agg(['mean', 'min', 'max', 'std']).reset_index()
-                depth_df.columns = ['date'] + [f'depth_{col}' for col in depth_df.columns[1:]]
-                daily_stats = pd.merge(daily_stats, depth_df, on='date')
-            except:
-                print("Warning: Issue calculating depth statistics. Skipping.")
-            
-        # Add intensity statistics if available
-        if 'intensity' in data.columns:
-            try:
-                intensity_df = data.groupby('date')['intensity'].agg(['mean', 'max']).reset_index()
-                intensity_df.columns = ['date'] + [f'intensity_{col}' for col in intensity_df.columns[1:]]
-                daily_stats = pd.merge(daily_stats, intensity_df, on='date')
-            except:
-                print("Warning: Issue calculating intensity statistics. Skipping.")
-            
-        return daily_stats
+    return daily_stats
+
+# Function to create sequences for model input
+def create_sequences(data, seq_length, predict_magnitude=False):
+    X, y_binary, y_magnitude, y_depth, y_intensity = [], [], [], [], []
     
     # Get daily statistics
     daily_data = get_daily_stats(data)
@@ -135,33 +161,24 @@ def create_sequences(data, seq_length, predict_magnitude=False):
             else:
                 y_magnitude.append(0)  # No earthquake means magnitude 0
                 
-            # Get max depth for the target date (if available)
-            target_data = data[data['date'] == target_date]
-            if len(target_data) > 0 and 'depth' in target_data.columns:
-                max_depth_idx = target_data['mag'].idxmax() if len(target_data) > 0 else None
-                if max_depth_idx is not None and not pd.isna(max_depth_idx):
-                    depth_at_max_mag = target_data.loc[max_depth_idx, 'depth']
-                    y_depth.append(depth_at_max_mag if not pd.isna(depth_at_max_mag) else 0)
-                else:
-                    y_depth.append(0)
+            # Get depth at max magnitude for the target date
+            target_depth = daily_depth_intensity[daily_depth_intensity['date'] == target_date]['depth_at_max_mag'].values
+            if len(target_depth) > 0:
+                y_depth.append(target_depth[0])
             else:
                 y_depth.append(0)
                 
-            # Get max intensity for the target date (if available)
-            if len(target_data) > 0 and 'intensity' in target_data.columns:
-                max_intensity_idx = target_data['mag'].idxmax() if len(target_data) > 0 else None
-                if max_intensity_idx is not None and not pd.isna(max_intensity_idx):
-                    intensity_at_max_mag = target_data.loc[max_intensity_idx, 'intensity']
-                    y_intensity.append(intensity_at_max_mag if not pd.isna(intensity_at_max_mag) else 0)
-                else:
-                    y_intensity.append(0)
+            # Get intensity at max magnitude for the target date
+            target_intensity = daily_depth_intensity[daily_depth_intensity['date'] == target_date]['intensity_at_max_mag'].values
+            if len(target_intensity) > 0:
+                y_intensity.append(target_intensity[0])
             else:
                 y_intensity.append(0)
     
     return np.array(X), np.array(y_binary), np.array(y_magnitude), np.array(y_depth), np.array(y_intensity)
 
-# Parameters - Changed from 7 to 100 days
-sequence_length = 100  # Use 100 days of data to predict the next day
+# Parameters - Using 100 days of data to predict the next day
+sequence_length = 100
 print(f"Using {sequence_length} previous days to predict the next day")
 
 # Filter data for training (strictly before cutoff date)
@@ -196,13 +213,15 @@ X_train_reshaped = X_train.reshape(n_samples * n_timesteps, n_features)
 X_train_scaled = scaler.fit_transform(X_train_reshaped)
 X_train = X_train_scaled.reshape(n_samples, n_timesteps, n_features)
 
-# Build the LSTM-CNN hybrid model for binary classification and magnitude prediction
-def build_hybrid_model(input_shape):
+# Save the scaler for future use
+joblib.dump(scaler, 'combined_earthquake_scaler.pkl')
+
+# Build the combined LSTM-CNN-Transformer model
+def build_combined_model(input_shape, head_size=64, num_heads=4, ff_dim=256, num_transformer_blocks=4):
     # Input layer
     input_layer = Input(shape=input_shape)
     
-    # Shared layers
-    # CNN Branch - Adjusted for longer sequences
+    # CNN Branch
     conv1 = Conv1D(filters=32, kernel_size=5, activation='relu', padding='same')(input_layer)
     pool1 = MaxPooling1D(pool_size=4)(conv1)
     conv2 = Conv1D(filters=64, kernel_size=3, activation='relu', padding='same')(pool1)
@@ -211,7 +230,7 @@ def build_hybrid_model(input_shape):
     pool3 = MaxPooling1D(pool_size=2)(conv3)
     cnn_flatten = Flatten()(pool3)
     
-    # LSTM Branch - Adjusted for longer sequences
+    # LSTM Branch
     lstm1 = LSTM(64, return_sequences=True)(input_layer)
     batch_norm1 = BatchNormalization()(lstm1)
     dropout1 = Dropout(0.3)(batch_norm1)
@@ -219,37 +238,47 @@ def build_hybrid_model(input_shape):
     batch_norm2 = BatchNormalization()(lstm2)
     lstm_output = Dropout(0.3)(batch_norm2)
     
-    # Combine branches
-    combined = tf.keras.layers.concatenate([cnn_flatten, lstm_output])
+    # Transformer Branch
+    x = input_layer
+    for _ in range(num_transformer_blocks):
+        x = transformer_encoder(x, head_size, num_heads, ff_dim, dropout=0.2)
+    transformer_output = GlobalAveragePooling1D()(x)
     
-    # Dense shared layer
-    dense_shared = Dense(64, activation='relu')(combined)
+    # Combine all branches
+    combined = Concatenate()([cnn_flatten, lstm_output, transformer_output])
+    
+    # Shared dense layers
+    dense_shared = Dense(128, activation='relu')(combined)
     dropout_shared = Dropout(0.3)(dense_shared)
     
     # Binary classification branch (earthquake occurrence)
-    binary_dense = Dense(32, activation='relu')(dropout_shared)
+    binary_dense = Dense(64, activation='relu')(dropout_shared)
     binary_output = Dense(1, activation='sigmoid', name='binary_output')(binary_dense)
     
     # Magnitude prediction branch (regression)
-    magnitude_dense1 = Dense(64, activation='relu')(dropout_shared)
-    magnitude_dense2 = Dense(32, activation='relu')(magnitude_dense1)
-    magnitude_output = Dense(1, name='magnitude_output')(magnitude_dense2)
+    magnitude_dense = Dense(64, activation='relu')(dropout_shared)
+    magnitude_output = Dense(1, name='magnitude_output')(magnitude_dense)
     
     # Depth prediction branch (regression)
-    depth_dense1 = Dense(64, activation='relu')(dropout_shared)
-    depth_dense2 = Dense(32, activation='relu')(depth_dense1)
-    depth_output = Dense(1, name='depth_output')(depth_dense2)
+    depth_dense = Dense(64, activation='relu')(dropout_shared)
+    depth_output = Dense(1, name='depth_output')(depth_dense)
     
     # Intensity prediction branch (regression)
-    intensity_dense1 = Dense(64, activation='relu')(dropout_shared)
-    intensity_dense2 = Dense(32, activation='relu')(intensity_dense1)
-    intensity_output = Dense(1, name='intensity_output')(intensity_dense2)
+    intensity_dense = Dense(64, activation='relu')(dropout_shared)
+    intensity_output = Dense(1, name='intensity_output')(intensity_dense)
     
     model = Model(inputs=input_layer, outputs=[binary_output, magnitude_output, depth_output, intensity_output])
     return model
 
 # Create and compile the model
-model = build_hybrid_model((sequence_length, n_features))
+model = build_combined_model(
+    input_shape=(sequence_length, n_features),
+    head_size=64,
+    num_heads=4,
+    ff_dim=256,
+    num_transformer_blocks=4
+)
+
 model.compile(
     optimizer=Adam(learning_rate=0.001),
     loss={
@@ -273,7 +302,7 @@ model.summary()
 callbacks = [
     EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True),
     ModelCheckpoint(
-        filepath='best_earthquake_model.keras',
+        filepath='best_combined_earthquake_model.keras',
         monitor='val_loss',
         save_best_only=True
     )
@@ -288,16 +317,15 @@ history = model.fit(
         'depth_output': y_train_depth,
         'intensity_output': y_train_intensity
     },
-    epochs=100,  # Increased from 50 to 100
-    batch_size=16,  # Reduced batch size for better generalization
+    epochs=100,
+    batch_size=16,
     validation_split=0.2,
     callbacks=callbacks,
     verbose=1
 )
 
-# Save the model and scaler
-model.save('lstm_cnn_earthquake_model.keras')
-joblib.dump(scaler, 'earthquake_scaler.pkl')
+# Save the model
+model.save('combined_earthquake_model.keras')
 
 # Plot training history
 plt.figure(figsize=(15, 12))
@@ -357,7 +385,7 @@ plt.xlabel('Epoch')
 plt.legend(['Train', 'Validation'], loc='upper right')
 
 plt.tight_layout()
-plt.savefig('training_history.png')
+plt.savefig('combined_training_history.png')
 
 # Prepare data for predicting the target date
 target_date = target_prediction_date
@@ -376,40 +404,6 @@ print(f"Spanning {len(pred_seq_df['date'].unique())} unique days")
 
 # Create the feature sequence for prediction
 if len(pred_seq_df) > 0:
-    # Use the same function that was used for training
-    # Group by date and calculate daily statistics
-    def get_daily_stats(data):
-        # Base statistics for all columns
-        daily_stats = data.groupby('date').agg({
-            'longitude': ['mean', 'min', 'max', 'std'],
-            'latitude': ['mean', 'min', 'max', 'std'],
-            'mag': ['mean', 'min', 'max', 'std', 'count']
-        })
-        
-        # Flatten the multi-index columns
-        daily_stats.columns = [f'{col[0]}_{col[1]}' for col in daily_stats.columns]
-        daily_stats = daily_stats.reset_index()
-        
-        # Add depth statistics if available
-        if 'depth' in data.columns:
-            try:
-                depth_df = data.groupby('date')['depth'].agg(['mean', 'min', 'max', 'std']).reset_index()
-                depth_df.columns = ['date'] + [f'depth_{col}' for col in depth_df.columns[1:]]
-                daily_stats = pd.merge(daily_stats, depth_df, on='date')
-            except:
-                print("Warning: Issue calculating depth statistics. Skipping.")
-            
-        # Add intensity statistics if available
-        if 'intensity' in data.columns:
-            try:
-                intensity_df = data.groupby('date')['intensity'].agg(['mean', 'max']).reset_index()
-                intensity_df.columns = ['date'] + [f'intensity_{col}' for col in intensity_df.columns[1:]]
-                daily_stats = pd.merge(daily_stats, intensity_df, on='date')
-            except:
-                print("Warning: Issue calculating intensity statistics. Skipping.")
-            
-        return daily_stats
-    
     # Get daily statistics for prediction data
     pred_daily_data = get_daily_stats(pred_seq_df)
     
@@ -463,7 +457,7 @@ if len(pred_seq_df) > 0:
     
     # For demonstration, amplify the magnitude prediction to simulate larger predictions
     # This is based on the user's request to show a larger magnitude prediction
-    amplified_magnitude = predicted_magnitude * 1.5  # 50% increase
+    amplified_magnitude = predicted_magnitude * 2.0  # Double the magnitude
     print(f"Amplified magnitude prediction (for demonstration): {amplified_magnitude:.2f}")
     
     # Get actual data for the target date (if available in the dataset)
@@ -502,11 +496,11 @@ history_dir = os.path.join('history', timestamp)
 os.makedirs(history_dir, exist_ok=True)
 
 # Save model, training history, and plots
-model.save(os.path.join(history_dir, 'lstm_cnn_earthquake_model.keras'))
-joblib.dump(scaler, os.path.join(history_dir, 'earthquake_scaler.pkl'))
-pd.DataFrame(history.history).to_csv(os.path.join(history_dir, 'training_history.csv'), index=False)
-plt.savefig(os.path.join(history_dir, 'training_history.png'))
+model.save(os.path.join(history_dir, 'combined_earthquake_model.keras'))
+joblib.dump(scaler, os.path.join(history_dir, 'combined_earthquake_scaler.pkl'))
+pd.DataFrame(history.history).to_csv(os.path.join(history_dir, 'combined_training_history.csv'), index=False)
+plt.savefig(os.path.join(history_dir, 'combined_training_history.png'))
 
 # Save a copy of this script
 import shutil
-shutil.copy(__file__, os.path.join(history_dir, 'lstm_cnn_training.py'))
+shutil.copy(__file__, os.path.join(history_dir, 'combined_earthquake_model.py')) 

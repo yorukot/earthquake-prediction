@@ -7,7 +7,7 @@ df = pd.read_csv('data/origin.csv')
 
 # 刪除 '編號' 以及 '位置' 欄位
 if '編號' in df.columns and '位置' in df.columns:
-    df = df.drop(columns=['編號', '位置', '深度', '最大震度'])
+    df = df.drop(columns=['編號', '位置'])
 
 # 處理缺失值 (填補或刪除)
 df = df.dropna()  # 這裡選擇刪除有缺失的行
@@ -19,13 +19,15 @@ column_mapping = {
     '經度': 'longitude',
     '緯度': 'latitude',
     '規模': 'mag',
+    '深度': 'depth',
+    '最大震度': 'intensity',
 }
 
 # 重命名欄位
 df = df.rename(columns=column_mapping)
 
 # 確保有必要的欄位
-required_columns = ['time', 'longitude', 'latitude', 'mag']
+required_columns = ['time', 'longitude', 'latitude', 'mag', 'depth', 'intensity']
 for col in required_columns:
     if col not in df.columns:
         print(f"警告: 缺少必要欄位 '{col}'")
